@@ -30,3 +30,41 @@ def test_author_entropy_single_author():
 def test_author_entropy_two_equal_authors():
     result = calculate_author_entropy(["alice", "bob"])
     assert result == pytest.approx(1.0)
+
+from collect import fetch_prs_in_quarter, fetch_commits_in_quarter
+
+def test_fetch_prs_marks_reviewed_by_third_party(mocker):
+    mocker.patch("collect._get", side_effect=[
+        # page 1: one merged PR
+        [{"number": 1, "user": {"login": "alice"}, "merged_at": "2024-02-10T12:00:00Z"}],
+        # page 2: empty (pagination end for PRs)
+        [],
+        # reviews for PR #1: approved by bob (not alice)
+        [{"state": "APPROVED", "user": {"login": "bob"}}],
+        # empty page (pagination end for reviews)
+        [],
+    ])
+    prs = fetch_prs_in_quarter("owner/repo", 2024, 1)
+    assert len(prs) == 1
+    assert prs[0]["reviewed_by_third_party"] is True
+
+def test_fetch_prs_self_review_not_counted(mocker):
+    mocker.patch("collect._get", side_effect=[
+        [{"number": 2, "user": {"login": "alice"}, "merged_at": "2024-02-10T12:00:00Z"}],
+        [],
+        [{"state": "APPROVED", "user": {"login": "alice"}}],
+        [],
+    ])
+    prs = fetch_prs_in_quarter("owner/repo", 2024, 1)
+    assert prs[0]["reviewed_by_third_party"] is False
+
+def test_fetch_commits_excludes_bots(mocker):
+    mocker.patch("collect._get", side_effect=[
+        [
+            {"author": {"login": "alice"}},
+            {"author": {"login": "github-actions[bot]"}},
+        ],
+        [],
+    ])
+    authors = fetch_commits_in_quarter("owner/repo", 2024, 1)
+    assert authors == ["alice"]
