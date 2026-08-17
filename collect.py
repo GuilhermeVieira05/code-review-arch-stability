@@ -70,7 +70,7 @@ def fetch_prs_in_quarter(repo_full_name: str, year: int, q: int) -> list[dict]:
             continue
         merged_date = merged_at[:10]
         if merged_date < start:
-            break
+            continue
         if merged_date > end:
             continue
         raw_prs.append(pr)
