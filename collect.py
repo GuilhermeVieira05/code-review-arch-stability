@@ -14,7 +14,7 @@ def _headers() -> dict:
 
 def _get(url: str, params: dict = None) -> any:
     while True:
-        resp = requests.get(url, params=params, headers=_headers())
+        resp = requests.get(url, params=params, headers=_headers(), timeout=30)
         if resp.status_code == 403:
             remaining = int(resp.headers.get("X-RateLimit-Remaining", 1))
             if remaining == 0:
@@ -57,6 +57,25 @@ def calculate_author_entropy(authors: list[str]) -> float:
     counts = Counter(authors)
     total = len(authors)
     return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+def count_merged_prs_in_quarter(repo_full_name: str, year: int, q: int) -> int:
+    """Fast eligibility check — counts merged PRs without fetching reviews."""
+    start, end = quarter_dates(year, q)
+    count = 0
+    for pr in _paginate(
+        f"https://api.github.com/repos/{repo_full_name}/pulls",
+        {"state": "closed", "sort": "updated", "direction": "desc"},
+    ):
+        merged_at = pr.get("merged_at")
+        if not merged_at:
+            continue
+        merged_date = merged_at[:10]
+        if merged_date < start:
+            continue
+        if merged_date > end:
+            continue
+        count += 1
+    return count
 
 def fetch_prs_in_quarter(repo_full_name: str, year: int, q: int) -> list[dict]:
     start, end = quarter_dates(year, q)
@@ -112,51 +131,32 @@ def search_repos(language: str, min_stars: int, created_before: str) -> list[dic
     )
     return data["items"]
 
+FIXED_REPOS = {
+    "Python": ["django/django", "pallets/flask", "psf/requests"],
+    "Java":   ["spring-projects/spring-boot", "elastic/elasticsearch", "square/okhttp"],
+}
+
 def collect_all():
     from db import get_connection, init_db
-    from config import (REPOS_PER_LANGUAGE, MIN_STARS, YEARS_BACK,
-                        LANGUAGES, MIN_REVIEW_RATIO_THRESHOLD, MIN_PRS_PER_QUARTER)
+    from config import YEARS_BACK
 
-    created_before = (datetime.now() - timedelta(days=365 * 2)).strftime("%Y-%m-%d")
     now = datetime.now()
 
     with get_connection() as conn:
         init_db(conn)
 
-        for lang in LANGUAGES:
-            print(f"\n=== Selecting {REPOS_PER_LANGUAGE} {lang} repositories ===")
-            candidates = search_repos(lang, MIN_STARS, created_before)
-            selected = 0
+        for lang, repo_names in FIXED_REPOS.items():
+            print(f"\n=== Collecting {lang} repositories ===", flush=True)
 
-            for repo in candidates:
-                if selected >= REPOS_PER_LANGUAGE:
-                    break
+            for name in repo_names:
+                repo_meta = _get(f"https://api.github.com/repos/{name}")
+                repo_id = str(repo_meta["id"])
 
-                repo_id = str(repo["id"])
-                name = repo["full_name"]
-
-                # Quick eligibility check on the most recent complete quarter
-                sample_q = (now.month - 1) // 3 + 1
-                sample_year = now.year
-                if sample_q == 1:
-                    sample_q, sample_year = 4, now.year - 1
-                else:
-                    sample_q -= 1
-
-                sample_prs = fetch_prs_in_quarter(name, sample_year, sample_q)
-                if len(sample_prs) < MIN_PRS_PER_QUARTER:
-                    print(f"  skip {name}: too few PRs ({len(sample_prs)})")
-                    continue
-                ratio = calculate_review_ratio(sample_prs)
-                if ratio < MIN_REVIEW_RATIO_THRESHOLD:
-                    print(f"  skip {name}: review ratio too low ({ratio:.2f})")
-                    continue
-
-                print(f"  selected: {name}")
+                print(f"  {name} (⭐{repo_meta['stargazers_count']:,})", flush=True)
                 conn.execute(
                     "INSERT OR IGNORE INTO repos VALUES (?,?,?,?,?,?)",
-                    (repo_id, name, lang, repo["stargazers_count"],
-                     repo["created_at"], repo["clone_url"])
+                    (repo_id, name, lang, repo_meta["stargazers_count"],
+                     repo_meta["created_at"], repo_meta["clone_url"])
                 )
 
                 start_dt = now - timedelta(days=365 * YEARS_BACK)
@@ -170,6 +170,7 @@ def collect_all():
                         (repo_id, quarter_str)
                     ).fetchone()
                     if exists:
+                        print(f"    {quarter_str}: already collected, skipping", flush=True)
                         continue
 
                     prs = fetch_prs_in_quarter(name, qdate.year, q)
@@ -182,9 +183,8 @@ def collect_all():
                          len(prs),
                          sum(1 for p in prs if p["reviewed_by_third_party"]))
                     )
-                    print(f"    {quarter_str}: {len(prs)} PRs, ratio={calculate_review_ratio(prs):.2f}")
-
-                selected += 1
+                    conn.commit()
+                    print(f"    {quarter_str}: {len(prs)} PRs, ratio={calculate_review_ratio(prs):.2f}", flush=True)
 
         conn.commit()
 

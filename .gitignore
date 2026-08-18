@@ -1,6 +1,7 @@
-data/*.db
 data/snapshots/_clone_*/
+data/snapshots/
 java_analyzer/target/
 __pycache__/
 *.pyc
 .env
+.grimp_cache/

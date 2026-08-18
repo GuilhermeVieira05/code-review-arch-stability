@@ -19,36 +19,53 @@ def quarter_to_date(quarter: str) -> str:
 def aggregate_instability(packages: list[dict]) -> dict | None:
     if not packages:
         return None
-    total_ce, total_ca, count = 0, 0, 0
+    per_module_i = []
+    total_ce, total_ca = 0, 0
     for p in packages:
         ce, ca = p["ce"], p["ca"]
         if ce + ca > 0:
+            per_module_i.append(ce / (ce + ca))
             total_ce += ce
             total_ca += ca
-            count += 1
-    if count == 0:
+    if not per_module_i:
         return None
-    avg_ce = total_ce / count
-    avg_ca = total_ca / count
+    n = len(per_module_i)
     return {
-        "instability": avg_ce / (avg_ce + avg_ca),
-        "ce": avg_ce,
-        "ca": avg_ca,
+        "instability": sum(per_module_i) / n,
+        "ce": total_ce / n,
+        "ca": total_ca / n,
     }
 
-def _find_python_packages(snapshot_dir: Path) -> list[str]:
-    return [
+_SKIP_DIRS = {"tests", "test", "docs", "doc", "examples", "scripts", "benchmarks"}
+
+def _find_python_packages(snapshot_dir: Path) -> tuple[list[str], Path]:
+    # Prefer src/ or lib/ layout over root layout
+    for subdir in ("src", "lib"):
+        candidate = snapshot_dir / subdir
+        if candidate.is_dir():
+            pkgs = [
+                d.name for d in candidate.iterdir()
+                if d.is_dir() and (d / "__init__.py").exists()
+                and d.name not in _SKIP_DIRS
+            ]
+            if pkgs:
+                return pkgs, candidate
+
+    pkgs = [
         d.name for d in snapshot_dir.iterdir()
         if d.is_dir() and (d / "__init__.py").exists()
+        and d.name not in _SKIP_DIRS
     ]
+    return pkgs, snapshot_dir
 
 def calculate_python_instability(snapshot_dir: Path) -> dict | None:
-    packages = _find_python_packages(snapshot_dir)
+    packages, pkg_root = _find_python_packages(snapshot_dir)
     if not packages:
         return None
     old_path = sys.path[:]
     try:
-        sys.path.insert(0, str(snapshot_dir))
+        if str(pkg_root) not in sys.path:
+            sys.path.insert(0, str(pkg_root))
         graph = grimp.build_graph(*packages)
     except Exception:
         return None
@@ -94,11 +111,13 @@ def _get_commit_at_date(repo_dir: Path, date_str: str) -> str | None:
 
 def _checkout_snapshot(repo_dir: Path, commit_sha: str, snapshot_dir: Path):
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "--git-dir", str(repo_dir / ".git"),
-         "--work-tree", str(snapshot_dir),
-         "checkout", commit_sha, "--", "."],
+    archive = subprocess.run(
+        ["git", "-C", str(repo_dir), "archive", commit_sha],
         check=True, capture_output=True
+    )
+    subprocess.run(
+        ["tar", "-x", "-C", str(snapshot_dir)],
+        input=archive.stdout, check=True
     )
 
 def analyze_all():
@@ -114,7 +133,8 @@ def analyze_all():
             if not repo_dir.exists():
                 print(f"  Cloning {clone_url}...")
                 subprocess.run(
-                    ["git", "clone", clone_url, str(repo_dir)],
+                    ["git", "clone", "--filter=blob:none", "--no-single-branch",
+                     clone_url, str(repo_dir)],
                     check=True, capture_output=True
                 )
 
@@ -161,13 +181,22 @@ def analyze_all():
                             "INSERT OR REPLACE INTO snapshots VALUES (?,?,?)",
                             (repo_id, quarter, "done")
                         )
+                        conn.commit()
                         print(f"  {quarter}: I={result['instability']:.3f}")
                     else:
                         conn.execute(
                             "INSERT OR REPLACE INTO snapshots VALUES (?,?,?)",
                             (repo_id, quarter, "failed")
                         )
+                        conn.commit()
                         print(f"  {quarter}: analysis failed")
+                except Exception as e:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO snapshots VALUES (?,?,?)",
+                        (repo_id, quarter, "failed")
+                    )
+                    conn.commit()
+                    print(f"  {quarter}: error — {e}")
                 finally:
                     shutil.rmtree(snapshot_dir, ignore_errors=True)
 
